@@ -25,9 +25,26 @@ Ask one concrete investigative question at a time. Include the behavior,
 symbol, configuration, or execution path you need to understand. Prefer direct
 shell inspection when the exact file and location are already known.
 
-On success, parse the JSON object on stdout. `summary` is the direct answer,
-`nodes` contains evidence-bearing repository-relative code locations, and
-`edges` describes relationships between node IDs. An empty `edges` array means
+On success, parse the JSON codemap on stdout:
+
+```json
+{
+  "summary": "direct answer",
+  "nodes": [
+    {
+      "id": "unique-id",
+      "location": "relative/path:line-line",
+      "symbol": "optional symbol",
+      "description": "fact established by this location"
+    }
+  ],
+  "edges": [
+    {"from": "node-id", "to": "node-id", "relation": "calls or data flow"}
+  ]
+}
+```
+
+Every edge references node IDs. `symbol` is optional, and `edges` is empty when
 the answer does not need a relationship graph.
 
 `lmg` automatically supplies repository-root instructions from `AGENTS.md`,
