@@ -40,12 +40,14 @@ On success, parse the JSON codemap on stdout:
   ],
   "edges": [
     {"from": "node-id", "to": "node-id", "relation": "calls or data flow"}
-  ]
+  ],
+  "usage": {"input": 100, "output": 20, "cache_read": 80, "cache_create": 0}
 }
 ```
 
 Every edge references node IDs. `symbol` is optional, and `edges` is empty when
-the answer does not need a relationship graph.
+the answer does not need a relationship graph. `usage` is added by `lmg` and
+aggregates provider token counts across every agent round.
 
 `lmg` automatically supplies repository-root instructions from `AGENTS.md`,
 falling back to `CLAUDE.md` only when `AGENTS.md` is absent. Callers do not need
@@ -61,7 +63,15 @@ home and parent environment. Keep it enabled for ordinary research. Use
 process's filesystem and network access; environment scrubbing and other limits
 still remain active.
 
-If investigation fails, use `--verbose` to put tool activity on stderr. Do not
-substitute `--yolo` for missing endpoint, API-key, model, or sandbox setup.
+Use `--verbose` to put tool activity and per-round input, output, cache-read,
+and cache-create token counts on stderr. Do not substitute `--yolo` for missing
+endpoint, API-key, model, or sandbox setup.
+
+Network failures and retryable HTTP responses are retried indefinitely with
+bounded exponential backoff, so an invocation may keep waiting during a
+provider outage until it succeeds or the caller terminates it.
+
+Parallel tool calling is enabled by default, allowing the model to request
+multiple repository inspections in one turn.
 
 Run `lmg --skill` to print this skill from the installed binary.

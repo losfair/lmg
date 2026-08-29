@@ -29,18 +29,17 @@
 #include <unistd.h>
 
 #define DEFAULT_MODEL "gpt-4.1-mini"
-#define DEFAULT_MAX_STEPS 8
-#define MAX_MAX_STEPS 100
 #define TOOL_OUTPUT_LIMIT (64U * 1024U)
 #define HTTP_RESPONSE_LIMIT (16U * 1024U * 1024U)
 #define CONFIG_FILE_LIMIT (16U * 1024U * 1024U)
 #define INSTRUCTION_FILE_LIMIT (256U * 1024U)
 #define COMMAND_TIMEOUT_SECONDS 30
+#define RETRY_INITIAL_SECONDS 1U
+#define RETRY_MAX_SECONDS 30U
 #define TOOL_PATH "/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
 #define EXIT_LOCAL 1
 #define EXIT_API 2
-#define EXIT_AGENT 3
 
 static const char *SYSTEM_PROMPT =
     "You are a codebase search agent.\n\n"
@@ -74,7 +73,6 @@ struct config {
     char *model;
     char *repo;
     char *question;
-    int max_steps;
     bool verbose;
     bool yolo;
     json_object *extra;
@@ -186,18 +184,6 @@ static const char *plain_json_string(json_object *obj)
     return s;
 }
 
-static bool parse_positive_int(const char *s, int *out)
-{
-    char *end = NULL;
-    long n;
-    errno = 0;
-    n = strtol(s, &end, 10);
-    if (errno || !s[0] || !end || *end || n < 1 || n > MAX_MAX_STEPS)
-        return false;
-    *out = (int)n;
-    return true;
-}
-
 static json_object *parse_json_strict(const char *text, size_t len)
 {
     json_tokener *tok = json_tokener_new();
@@ -294,13 +280,6 @@ static bool apply_config_object(struct config *cfg, json_object *root)
         if (!(s = plain_json_string(v))) return false;
         replace_string(&cfg->model, s);
     }
-    if (json_object_object_get_ex(root, "max_steps", &v)) {
-        int64_t n;
-        if (!json_object_is_type(v, json_type_int)) return false;
-        n = json_object_get_int64(v);
-        if (n < 1 || n > MAX_MAX_STEPS) return false;
-        cfg->max_steps = (int)n;
-    }
     if (json_object_object_get_ex(root, "extra", &v)) {
         if (!json_object_is_type(v, json_type_object)) return false;
         merge_extra(cfg, v);
@@ -353,11 +332,6 @@ static int load_environment(struct config *cfg)
     if (s) replace_string(&cfg->api_key, s);
     s = getenv("LMG_MODEL");
     if (s) replace_string(&cfg->model, s);
-    s = getenv("LMG_MAX_STEPS");
-    if (s && !parse_positive_int(s, &cfg->max_steps)) {
-        fputs("lmg: invalid LMG_MAX_STEPS\n", stderr);
-        return -1;
-    }
     s = getenv("LMG_EXTRA_JSON");
     if (s) {
         extra = parse_json_strict(s, strlen(s));
@@ -372,7 +346,7 @@ static int load_environment(struct config *cfg)
 
 static void usage(FILE *f)
 {
-    fputs("usage: lmg [-C DIR] [-m MODEL] [-e URL] [-k N] [--verbose] [--yolo] QUESTION\n"
+    fputs("usage: lmg [-C DIR] [-m MODEL] [-e URL] [--verbose] [--yolo] QUESTION\n"
           "       lmg --skill\n", f);
 }
 
@@ -395,17 +369,11 @@ static int parse_cli(struct config *cfg, int argc, char **argv)
         {NULL, 0, NULL, 0}
     };
     int c;
-    while ((c = getopt_long(argc, argv, "C:m:e:k:h", options, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "C:m:e:h", options, NULL)) != -1) {
         switch (c) {
         case 'C': replace_string(&cfg->repo, optarg); break;
         case 'm': replace_string(&cfg->model, optarg); break;
         case 'e': replace_string(&cfg->endpoint, optarg); break;
-        case 'k':
-            if (!parse_positive_int(optarg, &cfg->max_steps)) {
-                fputs("lmg: invalid maximum round count\n", stderr);
-                return -1;
-            }
-            break;
         case 1000: cfg->verbose = true; break;
         case 1001: cfg->yolo = true; break;
         case 'h': usage(stdout); exit(0);
@@ -901,6 +869,44 @@ static size_t http_write_callback(char *ptr, size_t size, size_t nmemb, void *us
     return n;
 }
 
+static bool retryable_http_status(long status)
+{
+    return status == 408 || status == 409 || status == 425 || status == 429 ||
+           (status >= 500 && status <= 599);
+}
+
+static bool retryable_curl_error(CURLcode code)
+{
+    switch (code) {
+    case CURLE_UNSUPPORTED_PROTOCOL:
+    case CURLE_FAILED_INIT:
+    case CURLE_URL_MALFORMAT:
+    case CURLE_NOT_BUILT_IN:
+    case CURLE_OUT_OF_MEMORY:
+    case CURLE_WRITE_ERROR:
+    case CURLE_ABORTED_BY_CALLBACK:
+    case CURLE_BAD_FUNCTION_ARGUMENT:
+    case CURLE_TOO_MANY_REDIRECTS:
+        return false;
+    default:
+        return true;
+    }
+}
+
+static void wait_before_retry(unsigned *delay_seconds)
+{
+    struct timespec delay;
+    struct timespec remaining;
+    delay.tv_sec = (time_t)*delay_seconds;
+    delay.tv_nsec = 0;
+    while (nanosleep(&delay, &remaining) < 0 && errno == EINTR)
+        delay = remaining;
+    if (*delay_seconds < RETRY_MAX_SECONDS) {
+        unsigned next = *delay_seconds * 2;
+        *delay_seconds = next < RETRY_MAX_SECONDS ? next : RETRY_MAX_SECONDS;
+    }
+}
+
 static int post_chat(const struct config *cfg, json_object *request,
                      json_object **response)
 {
@@ -910,6 +916,7 @@ static int post_chat(const struct config *cfg, json_object *request,
     char *auth = NULL;
     CURLcode cc;
     long status = 0;
+    unsigned retry_delay = RETRY_INITIAL_SECONDS;
     json_object *parsed;
     const char *payload = json_object_to_json_string_ext(request, JSON_C_TO_STRING_PLAIN);
     if (!curl || !buffer_init(&body, HTTP_RESPONSE_LIMIT)) {
@@ -936,15 +943,35 @@ static int post_chat(const struct config *cfg, json_object *request,
 #else
     curl_easy_setopt(curl, CURLOPT_PROTOCOLS, CURLPROTO_HTTP | CURLPROTO_HTTPS);
 #endif
-    cc = curl_easy_perform(curl);
-    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
-    if (cc != CURLE_OK) {
-        fprintf(stderr, "lmg: API request failed: %s\n", curl_easy_strerror(cc));
-        return -1;
-    }
-    if (status < 200 || status >= 300) {
-        fprintf(stderr, "lmg: API returned HTTP %ld\n", status);
-        return -1;
+    for (;;) {
+        body.len = 0;
+        body.data[0] = '\0';
+        body.truncated = false;
+        status = 0;
+        cc = curl_easy_perform(curl);
+        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
+        if (cc != CURLE_OK) {
+            if (!retryable_curl_error(cc)) {
+                fprintf(stderr, "lmg: API request failed: %s\n",
+                        curl_easy_strerror(cc));
+                return -1;
+            }
+            fprintf(stderr, "lmg: API request failed: %s; retrying in %us\n",
+                    curl_easy_strerror(cc), retry_delay);
+            wait_before_retry(&retry_delay);
+            continue;
+        }
+        if (status < 200 || status >= 300) {
+            if (!retryable_http_status(status)) {
+                fprintf(stderr, "lmg: API returned HTTP %ld\n", status);
+                return -1;
+            }
+            fprintf(stderr, "lmg: API returned HTTP %ld; retrying in %us\n",
+                    status, retry_delay);
+            wait_before_retry(&retry_delay);
+            continue;
+        }
+        break;
     }
     parsed = parse_json_strict(body.data, body.len);
     if (!parsed || !json_object_is_type(parsed, json_type_object)) {
@@ -1094,13 +1121,14 @@ static json_object *make_request(const struct config *cfg, json_object *messages
     json_object_object_foreach(cfg->extra, key, value) {
         if (strcmp(key, "model") != 0 && strcmp(key, "messages") != 0 &&
             strcmp(key, "tools") != 0 && strcmp(key, "tool_choice") != 0 &&
-            strcmp(key, "stream") != 0)
+            strcmp(key, "parallel_tool_calls") != 0 && strcmp(key, "stream") != 0)
             json_object_object_add(request, key, json_object_get(value));
     }
     json_object_object_add(request, "model", json_object_new_string(cfg->model));
     json_object_object_add(request, "messages", json_object_get(messages));
     json_object_object_add(request, "tools", json_object_get(tools));
     json_object_object_add(request, "tool_choice", json_object_new_string("auto"));
+    json_object_object_add(request, "parallel_tool_calls", json_object_new_boolean(true));
     json_object_object_add(request, "stream", json_object_new_boolean(false));
     return request;
 }
@@ -1118,6 +1146,126 @@ static json_object *response_message(json_object *response)
         !json_object_is_type(message, json_type_object))
         return NULL;
     return message;
+}
+
+static bool nonnegative_integer_field(json_object *object, const char *key,
+                                      int64_t *value)
+{
+    json_object *field;
+    if (!object || !json_object_is_type(object, json_type_object) ||
+        !json_object_object_get_ex(object, key, &field) ||
+        !json_object_is_type(field, json_type_int))
+        return false;
+    *value = json_object_get_int64(field);
+    return *value >= 0;
+}
+
+static bool first_integer_field(json_object *object, const char *first,
+                                const char *second, int64_t *value)
+{
+    return nonnegative_integer_field(object, first, value) ||
+           nonnegative_integer_field(object, second, value);
+}
+
+static bool nested_integer_field(json_object *object, const char *container,
+                                 const char *key, int64_t *value)
+{
+    json_object *nested;
+    return object && json_object_is_type(object, json_type_object) &&
+           json_object_object_get_ex(object, container, &nested) &&
+           nonnegative_integer_field(nested, key, value);
+}
+
+struct token_usage {
+    bool returned;
+    bool has_input;
+    bool has_output;
+    bool has_cache_read;
+    bool has_cache_create;
+    int64_t input;
+    int64_t output;
+    int64_t cache_read;
+    int64_t cache_create;
+};
+
+static void extract_token_usage(json_object *response, struct token_usage *stats)
+{
+    json_object *usage;
+    memset(stats, 0, sizeof(*stats));
+    if (!json_object_object_get_ex(response, "usage", &usage) ||
+        !json_object_is_type(usage, json_type_object))
+        return;
+    stats->returned = true;
+    stats->has_input = first_integer_field(
+        usage, "prompt_tokens", "input_tokens", &stats->input);
+    stats->has_output = first_integer_field(
+        usage, "completion_tokens", "output_tokens", &stats->output);
+    stats->has_cache_read =
+        nonnegative_integer_field(
+            usage, "cache_read_input_tokens", &stats->cache_read) ||
+        nonnegative_integer_field(usage, "cached_tokens", &stats->cache_read) ||
+        nested_integer_field(
+            usage, "prompt_tokens_details", "cached_tokens", &stats->cache_read) ||
+        nested_integer_field(
+            usage, "input_tokens_details", "cached_tokens", &stats->cache_read);
+    stats->has_cache_create =
+        nonnegative_integer_field(
+            usage, "cache_creation_input_tokens", &stats->cache_create) ||
+        nonnegative_integer_field(
+            usage, "cache_write_tokens", &stats->cache_create) ||
+        nested_integer_field(
+            usage, "prompt_tokens_details", "cache_write_tokens",
+            &stats->cache_create) ||
+        nested_integer_field(
+            usage, "input_tokens_details", "cache_write_tokens",
+            &stats->cache_create);
+}
+
+static char *token_count_text(bool present, int64_t value)
+{
+    if (!present)
+        return xstrdup("-");
+    return xasprintf("%lld", (long long)value);
+}
+
+static void log_token_usage(const struct token_usage *stats,
+                            unsigned long long round)
+{
+    char *input_text, *output_text, *cache_read_text, *cache_create_text;
+    if (!stats->returned) {
+        fprintf(stderr, "lmg: round %llu usage: unavailable\n", round);
+        return;
+    }
+    input_text = token_count_text(stats->has_input, stats->input);
+    output_text = token_count_text(stats->has_output, stats->output);
+    cache_read_text = token_count_text(stats->has_cache_read, stats->cache_read);
+    cache_create_text = token_count_text(
+        stats->has_cache_create, stats->cache_create);
+    fprintf(stderr,
+            "lmg: round %llu usage: input=%s output=%s cache-read=%s cache-create=%s\n",
+            round, input_text, output_text, cache_read_text, cache_create_text);
+}
+
+static int64_t saturated_token_sum(int64_t total, bool present, int64_t value)
+{
+    if (!present)
+        return total;
+    if (value > INT64_MAX - total)
+        return INT64_MAX;
+    return total + value;
+}
+
+static void add_token_usage(struct token_usage *total,
+                            const struct token_usage *round)
+{
+    total->input = saturated_token_sum(
+        total->input, round->has_input, round->input);
+    total->output = saturated_token_sum(
+        total->output, round->has_output, round->output);
+    total->cache_read = saturated_token_sum(
+        total->cache_read, round->has_cache_read, round->cache_read);
+    total->cache_create = saturated_token_sum(
+        total->cache_create, round->has_cache_create, round->cache_create);
 }
 
 static int parse_tool_call(json_object *call, const char **id, const char **name,
@@ -1327,9 +1475,19 @@ static void append_instruction_context(json_object *messages,
     append_tool_message(messages, call_id, result);
 }
 
-static void print_codemap(json_object *codemap)
+static void print_codemap(json_object *codemap,
+                          const struct token_usage *usage_total)
 {
-    const char *text = json_object_to_json_string_ext(
+    json_object *usage = json_object_new_object();
+    const char *text;
+    json_object_object_add(usage, "input", json_object_new_int64(usage_total->input));
+    json_object_object_add(usage, "output", json_object_new_int64(usage_total->output));
+    json_object_object_add(
+        usage, "cache_read", json_object_new_int64(usage_total->cache_read));
+    json_object_object_add(
+        usage, "cache_create", json_object_new_int64(usage_total->cache_create));
+    json_object_object_add(codemap, "usage", usage);
+    text = json_object_to_json_string_ext(
         codemap, JSON_C_TO_STRING_PRETTY | JSON_C_TO_STRING_NOSLASHESCAPE);
     fwrite(text, 1, strlen(text), stdout);
     fputc('\n', stdout);
@@ -1342,7 +1500,10 @@ static int run_agent(const struct config *cfg, const struct run_context *ctx)
     const char *instruction_filename;
     char *instruction_content;
     int instruction_status;
-    int round, rc = EXIT_AGENT;
+    unsigned long long round;
+    struct token_usage usage_total;
+    int rc = 0;
+    memset(&usage_total, 0, sizeof(usage_total));
     json_object_array_add(messages, make_message("system", SYSTEM_PROMPT));
     instruction_status = load_repository_instructions(
         cfg, &instruction_filename, &instruction_content);
@@ -1353,15 +1514,20 @@ static int run_agent(const struct config *cfg, const struct run_context *ctx)
     if (instruction_status > 0)
         append_instruction_context(messages, instruction_filename, instruction_content);
     json_object_array_add(messages, make_message("user", cfg->question));
-    for (round = 1; round <= cfg->max_steps; round++) {
+    for (round = 1; ; round++) {
         json_object *request = make_request(cfg, messages, tools);
         json_object *response = NULL;
         json_object *message, *calls;
+        struct token_usage round_usage;
         size_t i, call_count = 0;
         if (post_chat(cfg, request, &response) < 0) {
             rc = EXIT_API;
             break;
         }
+        extract_token_usage(response, &round_usage);
+        add_token_usage(&usage_total, &round_usage);
+        if (cfg->verbose)
+            log_token_usage(&round_usage, round);
         message = response_message(response);
         if (!message) {
             fputs("lmg: API response has no assistant message\n", stderr);
@@ -1422,7 +1588,7 @@ static int run_agent(const struct config *cfg, const struct run_context *ctx)
                         append_tool_message(messages, id, result_text);
                         continue;
                     }
-                    print_codemap(codemap);
+                    print_codemap(codemap, &usage_total);
                     return 0;
                 } else {
                     fprintf(stderr, "lmg: unknown tool: %s\n", name);
@@ -1435,8 +1601,6 @@ static int run_agent(const struct config *cfg, const struct run_context *ctx)
         }
         json_object_array_add(messages, make_message("user", CONTINUE_NUDGE));
     }
-    if (round > cfg->max_steps && rc == EXIT_AGENT)
-        fprintf(stderr, "lmg: agent exceeded %d rounds\n", cfg->max_steps);
     return rc;
 }
 
@@ -1450,7 +1614,6 @@ int main(int argc, char **argv)
         return print_embedded_skill();
     memset(&cfg, 0, sizeof(cfg));
     cfg.model = xstrdup(DEFAULT_MODEL);
-    cfg.max_steps = DEFAULT_MAX_STEPS;
     cfg.extra = json_object_new_object();
     if (!cfg.extra) die_oom();
     if (load_file_config(&cfg) < 0 || load_environment(&cfg) < 0 ||

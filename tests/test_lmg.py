@@ -5,6 +5,7 @@ import os
 import pathlib
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -14,6 +15,7 @@ import unittest
 
 BIN = pathlib.Path(os.environ.get("LMG_BIN", pathlib.Path(__file__).parents[1] / "lmg"))
 REPO = pathlib.Path(__file__).parents[1].resolve()
+DISCONNECT = object()
 
 
 class MockAPI:
@@ -27,8 +29,19 @@ class MockAPI:
                 body = self.rfile.read(int(self.headers["Content-Length"]))
                 owner.requests.append((self.headers, json.loads(body)))
                 response = next(owner.responses)
+                if response is DISCONNECT:
+                    self.close_connection = True
+                    try:
+                        self.connection.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        pass
+                    self.connection.close()
+                    return
+                status = 200
+                if isinstance(response, tuple):
+                    status, response = response
                 encoded = json.dumps(response).encode()
-                self.send_response(200)
+                self.send_response(status)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(encoded)))
                 self.end_headers()
@@ -54,8 +67,11 @@ class MockAPI:
         self.thread.join()
 
 
-def response(message):
-    return {"choices": [{"message": message}]}
+def response(message, usage=None):
+    result = {"choices": [{"message": message}]}
+    if usage is not None:
+        result["usage"] = usage
+    return result
 
 
 def codemap(summary="compact answer"):
@@ -63,12 +79,23 @@ def codemap(summary="compact answer"):
         "summary": summary,
         "nodes": [{
             "id": "agent-loop",
-            "location": "lmg.c:1329-1431",
+            "location": "lmg.c:1495-1603",
             "symbol": "run_agent",
             "description": "Runs tool calls and emits the completed result.",
         }],
         "edges": [],
     }
+
+
+def codemap_output(value, usage=None):
+    result = dict(value)
+    result["usage"] = usage if usage is not None else {
+        "input": 0,
+        "output": 0,
+        "cache_read": 0,
+        "cache_create": 0,
+    }
+    return result
 
 
 def finish_message(value=None, call_id="finish-call"):
@@ -89,6 +116,16 @@ def finish_message(value=None, call_id="finish-call"):
 
 
 class LmgTests(unittest.TestCase):
+    def test_help_has_no_round_limit_option(self):
+        with tempfile.TemporaryDirectory() as home:
+            proc = subprocess.run(
+                [BIN, "--help"], env={**os.environ, "HOME": home},
+                text=True, capture_output=True,
+            )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn("-k", proc.stdout)
+        self.assertNotIn("round", proc.stdout)
+
     def test_embedded_skill_matches_skill_file(self):
         with tempfile.TemporaryDirectory() as home:
             pathlib.Path(home, ".lmg.json").write_text("{")
@@ -114,7 +151,7 @@ class LmgTests(unittest.TestCase):
         for pattern in forbidden:
             self.assertIsNone(re.search(pattern, source), pattern)
 
-    def test_agent_loop_config_precedence_reasoning_and_limits(self):
+    def test_agent_loop_config_precedence_reasoning_usage_and_output_limits(self):
         assistant = {
             "role": "assistant",
             "content": None,
@@ -144,28 +181,44 @@ class LmgTests(unittest.TestCase):
         }
         final_map = codemap()
         final_map["nodes"][0]["location"] = "systems/README.md:1-40"
-        with MockAPI([response(assistant), response(finish_message(final_map))]) as api:
+        first_usage = {
+            "prompt_tokens": 100,
+            "completion_tokens": 5,
+            "prompt_tokens_details": {"cached_tokens": 10, "cache_write_tokens": 20},
+        }
+        second_usage = {
+            "prompt_tokens": 120,
+            "completion_tokens": 6,
+            "prompt_tokens_details": {"cached_tokens": 30, "cache_write_tokens": 0},
+        }
+        with MockAPI([
+            response(assistant, first_usage),
+            response(finish_message(final_map), second_usage),
+        ]) as api:
             with tempfile.TemporaryDirectory() as home:
                 pathlib.Path(home, ".lmg.json").write_text(json.dumps({
                     "endpoint": api.endpoint,
                     "api_key": "top-secret",
                     "model": "file-model",
-                    "max_steps": 7,
                     "extra": {"temperature": 0.9, "stream": True, "model": "not-owned"},
                 }))
                 env = {
                     **os.environ,
                     "HOME": home,
                     "LMG_MODEL": "env-model",
-                    "LMG_MAX_STEPS": "3",
-                    "LMG_EXTRA_JSON": json.dumps({"temperature": 0.2, "parallel_tool_calls": True}),
+                    "LMG_EXTRA_JSON": json.dumps({"temperature": 0.2, "parallel_tool_calls": False}),
                 }
                 proc = subprocess.run(
-                    [BIN, "--yolo", "-C", REPO, "-m", "cli-model", "-k", "2", "find it"],
+                    [BIN, "--yolo", "-C", REPO, "-m", "cli-model", "find it"],
                     env=env, text=True, capture_output=True, timeout=10,
                 )
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(json.loads(proc.stdout), final_map)
+        self.assertEqual(json.loads(proc.stdout), codemap_output(final_map, {
+            "input": 220,
+            "output": 11,
+            "cache_read": 40,
+            "cache_create": 20,
+        }))
         self.assertIn('"location":"systems/README.md:1-40"', proc.stdout.replace(" ", ""))
         self.assertNotIn(r"\/", proc.stdout)
         self.assertEqual(proc.stderr, "")
@@ -350,7 +403,7 @@ class LmgTests(unittest.TestCase):
                     text=True, capture_output=True, timeout=10,
                 )
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(json.loads(proc.stdout), final_map)
+        self.assertEqual(json.loads(proc.stdout), codemap_output(final_map))
         self.assertEqual(len(api.requests), 2)
         messages = api.requests[1][1]["messages"]
         unfinished_index = messages.index(unfinished)
@@ -358,6 +411,48 @@ class LmgTests(unittest.TestCase):
         self.assertEqual(nudge["role"], "user")
         self.assertIn("not called finish", nudge["content"])
         self.assertIn("Continue investigating", nudge["content"])
+
+    def test_verbose_logs_provider_token_usage_per_round(self):
+        unfinished = {"role": "assistant", "content": "still working"}
+        openrouter_usage = {
+            "prompt_tokens": 120,
+            "completion_tokens": 8,
+            "prompt_tokens_details": {
+                "cached_tokens": 80,
+                "cache_write_tokens": 32,
+            },
+        }
+        anthropic_usage = {
+            "input_tokens": 140,
+            "output_tokens": 12,
+            "cache_read_input_tokens": 100,
+            "cache_creation_input_tokens": 24,
+        }
+        with MockAPI([
+            response(unfinished, openrouter_usage),
+            response(finish_message(codemap("done")), anthropic_usage),
+        ]) as api:
+            with tempfile.TemporaryDirectory() as home:
+                pathlib.Path(home, ".lmg.json").write_text(json.dumps({
+                    "endpoint": api.endpoint,
+                }))
+                proc = subprocess.run(
+                    [BIN, "--yolo", "--verbose", "-C", REPO, "question"],
+                    env={**os.environ, "HOME": home},
+                    text=True, capture_output=True, timeout=10,
+                )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(json.loads(proc.stdout)["usage"], {
+            "input": 260,
+            "output": 20,
+            "cache_read": 180,
+            "cache_create": 56,
+        })
+        self.assertEqual(
+            proc.stderr,
+            "lmg: round 1 usage: input=120 output=8 cache-read=80 cache-create=32\n"
+            "lmg: round 2 usage: input=140 output=12 cache-read=100 cache-create=24\n",
+        )
 
     def test_invalid_codemap_gets_tool_error_and_can_retry(self):
         invalid = finish_message({"summary": "missing fields"}, "bad-finish")
@@ -373,7 +468,7 @@ class LmgTests(unittest.TestCase):
                     text=True, capture_output=True, timeout=10,
                 )
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(json.loads(proc.stdout), final_map)
+        self.assertEqual(json.loads(proc.stdout), codemap_output(final_map))
         tool_result = next(
             message for message in api.requests[1][1]["messages"]
             if message.get("tool_call_id") == "bad-finish"
@@ -381,21 +476,6 @@ class LmgTests(unittest.TestCase):
         self.assertEqual(tool_result["role"], "tool")
         self.assertEqual(tool_result["tool_call_id"], "bad-finish")
         self.assertIn("Invalid codemap", tool_result["content"])
-
-    def test_agent_text_without_finish_exhausts_round_limit(self):
-        with MockAPI([response({"role": "assistant", "content": "done"})]) as api:
-            with tempfile.TemporaryDirectory() as home:
-                pathlib.Path(home, ".lmg.json").write_text(json.dumps({
-                    "endpoint": api.endpoint,
-                }))
-                proc = subprocess.run(
-                    [BIN, "--yolo", "-k", "1", "question"],
-                    cwd=REPO, env={**os.environ, "HOME": home},
-                    text=True, capture_output=True, timeout=10,
-                )
-        self.assertEqual(proc.returncode, 3)
-        self.assertEqual(proc.stdout, "")
-        self.assertEqual(proc.stderr, "lmg: agent exceeded 1 rounds\n")
 
     def test_http_error_is_api_error(self):
         class ErrorHandler(http.server.BaseHTTPRequestHandler):
@@ -422,6 +502,40 @@ class LmgTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 2)
         self.assertEqual(proc.stdout, "")
         self.assertEqual(proc.stderr, "lmg: API returned HTTP 401\n")
+
+    def test_retries_network_and_retryable_http_errors(self):
+        usage = {
+            "prompt_tokens": 12,
+            "completion_tokens": 3,
+            "prompt_tokens_details": {"cached_tokens": 4, "cache_write_tokens": 5},
+        }
+        with MockAPI([
+            DISCONNECT,
+            (429, {"error": "busy"}),
+            response(finish_message(codemap("retried")), usage),
+        ]) as api:
+            with tempfile.TemporaryDirectory() as home:
+                pathlib.Path(home, ".lmg.json").write_text(json.dumps({
+                    "endpoint": api.endpoint,
+                }))
+                proc = subprocess.run(
+                    [BIN, "--yolo", "-C", REPO, "question"],
+                    env={**os.environ, "HOME": home},
+                    text=True, capture_output=True, timeout=10,
+                )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(len(api.requests), 3)
+        self.assertEqual(api.requests[0][1], api.requests[1][1])
+        self.assertEqual(api.requests[1][1], api.requests[2][1])
+        self.assertIn("lmg: API request failed:", proc.stderr)
+        self.assertIn("retrying in 1s", proc.stderr)
+        self.assertIn("lmg: API returned HTTP 429; retrying in 2s", proc.stderr)
+        self.assertEqual(json.loads(proc.stdout)["usage"], {
+            "input": 12,
+            "output": 3,
+            "cache_read": 4,
+            "cache_create": 5,
+        })
 
 
 if __name__ == "__main__":

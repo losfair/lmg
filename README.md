@@ -1,7 +1,7 @@
 # lmg
 
 `lmg` is a small native CLI that answers questions about a local codebase. It
-runs a short tool-calling agent loop, lets the model inspect the repository with
+runs a tool-calling agent loop, lets the model inspect the repository with
 normal Unix commands, and prints only the final evidence-rich codemap.
 
 ## Build
@@ -30,8 +30,7 @@ Create `~/.lmg.json`:
 {
   "endpoint": "https://openrouter.ai/api/v1/chat/completions",
   "api_key": "sk-...",
-  "model": "qwen/qwen3-coder",
-  "max_steps": 8
+  "model": "qwen/qwen3-coder"
 }
 ```
 
@@ -55,13 +54,20 @@ Successful output is a JSON codemap:
       "description": "Checks the expiry time and rejects expired sessions."
     }
   ],
-  "edges": []
+  "edges": [],
+  "usage": {
+    "input": 4210,
+    "output": 380,
+    "cache_read": 2048,
+    "cache_create": 1024
+  }
 }
 ```
 
 Nodes are evidence-bearing code locations. Edges connect node IDs to describe
 call, data-flow, control-flow, or ownership relationships. `lmg` emits a result
-only when the model calls its `finish` tool with a valid codemap.
+only when the model calls its `finish` tool with a valid codemap. `usage` is
+added by `lmg` and aggregates provider-returned token counts across all rounds.
 
 Before the first model request, `lmg` loads repository-root instructions from
 `AGENTS.md`, or from `CLAUDE.md` when `AGENTS.md` does not exist. It represents
@@ -70,19 +76,27 @@ conversation, without advertising that internal operation in the tool catalog.
 If neither file exists, no messages are injected.
 
 Configuration may also be supplied with `LMG_ENDPOINT`, `LMG_API_KEY`,
-`LMG_MODEL`, `LMG_MAX_STEPS`, and `LMG_EXTRA_JSON`. CLI options take precedence:
+`LMG_MODEL`, and `LMG_EXTRA_JSON`. CLI options take precedence:
 
 ```text
 -C DIR          repository root
 -m MODEL        model name
 -e URL          /chat/completions endpoint
--k N            maximum agent rounds
---verbose       print tool activity to stderr
+--verbose       print tool activity and per-round token usage to stderr
 --yolo          execute bash without OS sandboxing
 ```
 
-`--yolo` disables only the OS sandbox. Command timeouts, output limits, agent
-round limits, and environment scrubbing remain active.
+`--yolo` disables only the OS sandbox. Command timeouts, output limits, and
+environment scrubbing remain active. The agent loop has no round limit; it
+continues until `finish` succeeds or a local/API error occurs.
+
+Parallel tool calling is enabled on every model request. LMG accepts multiple
+`bash` calls in one assistant turn and returns a result for each call.
+
+Network failures and retryable API responses (HTTP 408, 409, 425, 429, and
+5xx) are retried indefinitely. Retries use exponential backoff from 1 second to
+a maximum of 30 seconds between attempts and are reported on stderr. Permanent
+HTTP errors still fail immediately.
 
 Coding agents can load the bundled usage skill without locating project files:
 
