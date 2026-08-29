@@ -18,7 +18,7 @@ lmg
     +-- bash: git ...
     |
     v
-concise answer + file:line references
+JSON codemap: summary + evidence nodes + relationship edges
 ```
 
 The search process, tool output, and model reasoning remain private to `lmg`.
@@ -91,7 +91,7 @@ lmg -C ~/src/project \
   "Trace how an HTTP request becomes an authenticated user"
 ```
 
-Stdout contains only the final answer.
+Stdout contains only the final JSON codemap.
 
 Diagnostics and tool activity go to stderr.
 
@@ -210,23 +210,45 @@ All config parsing and merging uses `json-c`.
 
 ## Agent Loop
 
-The private conversation is:
+Before the first API request, LMG checks the repository root for `AGENTS.md`. If
+it does not exist, LMG checks for `CLAUDE.md`. When one is found, its contents
+are represented as a synthetic tool exchange:
+
+```text
+assistant + load_agents_md({"path":"AGENTS.md"})
+tool + repository instruction contents
+```
+
+`load_agents_md` is an internal initialization event and is deliberately not
+included in the request's `tools` catalog. The instruction file is limited to
+256 KiB. If neither file exists, LMG injects neither the call nor a result.
+
+The private conversation is therefore:
 
 ```text
 system
+[optional assistant + load_agents_md]
+[optional tool + repository instructions]
 user
 assistant + reasoning + tool_calls
 tool
 assistant + reasoning + tool_calls
 tool
 ...
-assistant final answer
+assistant + finish(codemap)
 ```
 
 Pseudo-code:
 
 ```text
-messages = [system_prompt, user_question]
+messages = [system_prompt]
+
+if AGENTS.md exists:
+    append synthetic load_agents_md call and its file contents
+else if CLAUDE.md exists:
+    append synthetic load_agents_md call and its file contents
+
+append user_question
 
 for round = 1 .. max_steps:
     response = chat_completions(messages)
@@ -234,28 +256,35 @@ for round = 1 .. max_steps:
     assistant = response.choices[0].message
     append assistant unchanged enough to preserve reasoning state
 
-    if assistant.tool_calls:
-        for call in assistant.tool_calls:
-            result = execute_bash(call)
-            append tool result
+    if assistant called finish with a valid codemap:
+        print codemap as JSON
+        exit 0
+
+    if assistant called bash:
+        execute each bash call and append its tool result
         continue
 
-    if assistant.content:
-        print assistant.content
-        exit 0
+    if assistant did not call a tool:
+        append a user message reminding it to continue and call finish
+        continue
 
 fail
 ```
 
 Default maximum: 8 rounds.
 
-Multiple tool calls in one response are supported and may be executed sequentially.
+Multiple bash calls in one response are supported and may be executed
+sequentially. `finish` must be the only tool call in its response. Normal
+assistant content is never accepted as the final result; a turn containing only
+content receives a continuation nudge and consumes a round.
 
 ---
 
-## Tool
+## Tools
 
-The model gets exactly one function:
+The advertised tool catalog contains exactly two functions. The synthetic
+`load_agents_md` initialization call described above is not one of them. `bash`
+is the repository inspection primitive:
 
 ```json
 {
@@ -299,6 +328,39 @@ rg -l 'validate_session' . | head
 ```
 
 This gives the model normal Unix composition rather than exposing a growing collection of specialized tools.
+
+`finish` is the completion boundary. Its `codemap` argument has this logical
+shape (the actual function definition supplies the equivalent JSON Schema):
+
+```json
+{
+  "summary": "Concise direct answer",
+  "nodes": [
+    {
+      "id": "unique-short-id",
+      "location": "relative/path.c:12-34",
+      "symbol": "optional_symbol",
+      "description": "The fact this location proves"
+    }
+  ],
+  "edges": [
+    {
+      "from": "source-node-id",
+      "to": "destination-node-id",
+      "relation": "calls, feeds, owns, or another concise relationship"
+    }
+  ]
+}
+```
+
+`summary`, `nodes`, and `edges` are always present. Node IDs are unique. Each
+edge endpoint references a node ID. `symbol` is the only optional field. Use an
+empty `edges` array when the answer needs no graph. Locations use repository-
+relative `file:line` or `file:start-end` references.
+
+LMG validates the codemap again at runtime. A malformed map produces a tool
+error in the private conversation so the model can repair it on a later round.
+On a valid call, LMG pretty-prints only the `codemap` object to stdout and exits.
 
 ---
 
@@ -546,15 +608,16 @@ You are a codebase search agent.
 
 Answer the user's question using evidence from the repository.
 
-You have a bash tool. Use normal read-only Unix commands such as rg,
+You have bash and finish tools. Use bash with normal read-only Unix commands such as rg,
 find, sed, awk, git, and cat to search and inspect the codebase.
 
 Search iteratively. Do not speculate when you can inspect the code.
 Avoid unnecessarily large outputs.
-Stop once you have enough evidence.
 
-Return a concise answer with relevant file:line references.
-All repository paths in the final answer should be relative.
+Once you have enough evidence, call finish exactly once and do not call it alongside bash.
+The codemap has a summary, evidence nodes, and relationship edges between node ids.
+Do not return the final answer as normal assistant content. All node locations should
+use repository-relative file:line references.
 ```
 
 Safety comes from the sandbox rather than from asking the model to avoid dangerous shell commands.
@@ -593,15 +656,33 @@ Streaming is unnecessary for v1.
 
 ## Output
 
-The parent agent receives only the final answer:
+The parent agent receives only the final codemap:
 
-```text
-Session expiry is enforced in two places:
-
-- src/auth/session.c:142-171 — validate_session() rejects expired sessions.
-- src/http/middleware.c:88-103 — auth_middleware() turns that failure into 401.
-
-Session lifetime is assigned in src/auth/login.c:211-218.
+```json
+{
+  "summary": "Session expiry is validated before the HTTP failure is returned.",
+  "nodes": [
+    {
+      "id": "validate-session",
+      "location": "src/auth/session.c:142-171",
+      "symbol": "validate_session",
+      "description": "Rejects expired sessions."
+    },
+    {
+      "id": "auth-middleware",
+      "location": "src/http/middleware.c:88-103",
+      "symbol": "auth_middleware",
+      "description": "Turns session validation failure into HTTP 401."
+    }
+  ],
+  "edges": [
+    {
+      "from": "auth-middleware",
+      "to": "validate-session",
+      "relation": "calls before mapping failure to HTTP 401"
+    }
+  ]
+}
 ```
 
 It never receives the intermediate `rg`, `sed`, Git output, or model reasoning.
@@ -613,6 +694,7 @@ It never receives the intermediate `rg`, `sed`, Git output, or model reasoning.
 ```text
 lmg: invalid ~/.lmg.json
 lmg: endpoint is not configured
+lmg: cannot load AGENTS.md
 lmg: bwrap not found; use --yolo to run unsandboxed
 lmg: sandbox-exec failed; use --yolo to run unsandboxed
 lmg: API returned HTTP 401
@@ -636,11 +718,13 @@ Exit status:
 
 Version 1 does not need embeddings, indexing, AST parsing, MCP, a daemon, caching, editing APIs, provider SDKs, persistent state, or specialized search functions.
 
-There is one agent primitive:
+There is one repository-inspection primitive:
 
 ```text
 bash
 ```
+
+`finish` is a protocol boundary, not an additional inspection capability.
 
 The sandbox determines what that primitive is allowed to do.
 
@@ -660,7 +744,7 @@ Its boundary is:
 large noisy search/reasoning process
               |
               v
-small evidence-rich answer
+small evidence-rich codemap
 ```
 
 Everything inside that boundary should remain as simple as possible.

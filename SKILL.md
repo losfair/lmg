@@ -7,7 +7,7 @@ description: Use the lmg CLI to answer focused questions about a local codebase 
 
 Use `lmg` when answering a focused repository question would otherwise require
 several searches or produce noisy output. It runs its own search loop and
-returns only a concise answer with file and line evidence.
+returns only a concise JSON codemap with file and line evidence.
 
 Run it from the repository root:
 
@@ -24,6 +24,15 @@ lmg -C /path/to/repo "Trace how requests become authenticated users"
 Ask one concrete investigative question at a time. Include the behavior,
 symbol, configuration, or execution path you need to understand. Prefer direct
 shell inspection when the exact file and location are already known.
+
+On success, parse the JSON object on stdout. `summary` is the direct answer,
+`nodes` contains evidence-bearing repository-relative code locations, and
+`edges` describes relationships between node IDs. An empty `edges` array means
+the answer does not need a relationship graph.
+
+`lmg` automatically supplies repository-root instructions from `AGENTS.md`,
+falling back to `CLAUDE.md` only when `AGENTS.md` is absent. Callers do not need
+to include those instructions in the question.
 
 Treat the answer as research evidence, not authorization to modify anything.
 Before editing or making a high-impact decision, inspect the cited locations

@@ -58,6 +58,36 @@ def response(message):
     return {"choices": [{"message": message}]}
 
 
+def codemap(summary="compact answer"):
+    return {
+        "summary": summary,
+        "nodes": [{
+            "id": "agent-loop",
+            "location": "lmg.c:1329-1431",
+            "symbol": "run_agent",
+            "description": "Runs tool calls and emits the completed result.",
+        }],
+        "edges": [],
+    }
+
+
+def finish_message(value=None, call_id="finish-call"):
+    return {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [{
+            "id": call_id,
+            "type": "function",
+            "function": {
+                "name": "finish",
+                "arguments": json.dumps({
+                    "codemap": codemap() if value is None else value,
+                }),
+            },
+        }],
+    }
+
+
 class LmgTests(unittest.TestCase):
     def test_embedded_skill_matches_skill_file(self):
         with tempfile.TemporaryDirectory() as home:
@@ -112,7 +142,8 @@ class LmgTests(unittest.TestCase):
                 },
             ],
         }
-        with MockAPI([response(assistant), response({"role": "assistant", "content": "compact answer"})]) as api:
+        final_map = codemap()
+        with MockAPI([response(assistant), response(finish_message(final_map))]) as api:
             with tempfile.TemporaryDirectory() as home:
                 pathlib.Path(home, ".lmg.json").write_text(json.dumps({
                     "endpoint": api.endpoint,
@@ -133,7 +164,7 @@ class LmgTests(unittest.TestCase):
                     env=env, text=True, capture_output=True, timeout=10,
                 )
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(proc.stdout, "compact answer\n")
+        self.assertEqual(json.loads(proc.stdout), final_map)
         self.assertEqual(proc.stderr, "")
         self.assertEqual(len(api.requests), 2)
         headers, first = api.requests[0]
@@ -143,15 +174,100 @@ class LmgTests(unittest.TestCase):
         self.assertTrue(first["parallel_tool_calls"])
         self.assertFalse(first["stream"])
         self.assertEqual(first["tool_choice"], "auto")
+        self.assertEqual(
+            [tool["function"]["name"] for tool in first["tools"]],
+            ["bash", "finish"],
+        )
+        finish_schema = first["tools"][1]["function"]["parameters"]
+        map_schema = finish_schema["properties"]["codemap"]
+        self.assertEqual(map_schema["required"], ["summary", "nodes", "edges"])
+        self.assertEqual(
+            map_schema["properties"]["nodes"]["items"]["required"],
+            ["id", "location", "description"],
+        )
         second = api.requests[1][1]
-        self.assertEqual(second["messages"][2], assistant)
-        env_result = second["messages"][3]["content"]
+        self.assertIn(assistant, second["messages"])
+        env_result = next(
+            message["content"] for message in second["messages"]
+            if message.get("tool_call_id") == "env-call"
+        )
         self.assertIn("key= home=", env_result)
         self.assertNotIn("top-secret", env_result)
         self.assertIn(f"cwd={REPO}", env_result)
-        large_result = second["messages"][4]["content"]
+        large_result = next(
+            message["content"] for message in second["messages"]
+            if message.get("tool_call_id") == "large-call"
+        )
         self.assertIn("[output truncated]", large_result)
         self.assertLess(len(large_result), 66_000)
+
+    def test_repository_instructions_are_synthesized_with_fallback(self):
+        cases = [
+            (
+                {"AGENTS.md": "agents instructions", "CLAUDE.md": "claude instructions"},
+                "AGENTS.md",
+                "agents instructions",
+            ),
+            ({"CLAUDE.md": "fallback instructions"}, "CLAUDE.md", "fallback instructions"),
+        ]
+        for files, expected_path, expected_content in cases:
+            with self.subTest(expected_path=expected_path):
+                with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as home:
+                    for name, content in files.items():
+                        pathlib.Path(repo, name).write_text(content)
+                    with MockAPI([response(finish_message())]) as api:
+                        pathlib.Path(home, ".lmg.json").write_text(json.dumps({
+                            "endpoint": api.endpoint,
+                        }))
+                        proc = subprocess.run(
+                            [BIN, "--yolo", "-C", repo, "question"],
+                            env={**os.environ, "HOME": home},
+                            text=True, capture_output=True, timeout=10,
+                        )
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                request = api.requests[0][1]
+                self.assertEqual(
+                    [tool["function"]["name"] for tool in request["tools"]],
+                    ["bash", "finish"],
+                )
+                self.assertEqual(
+                    [message["role"] for message in request["messages"]],
+                    ["system", "assistant", "tool", "user"],
+                )
+                synthetic = request["messages"][1]
+                call = synthetic["tool_calls"][0]
+                self.assertEqual(call["function"]["name"], "load_agents_md")
+                self.assertEqual(
+                    json.loads(call["function"]["arguments"]),
+                    {"path": expected_path},
+                )
+                self.assertEqual(request["messages"][2]["tool_call_id"], call["id"])
+                self.assertEqual(
+                    request["messages"][2]["content"],
+                    f"Repository instructions loaded from {expected_path}:\n\n{expected_content}",
+                )
+
+    def test_missing_repository_instructions_injects_nothing(self):
+        with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as home:
+            with MockAPI([response(finish_message())]) as api:
+                pathlib.Path(home, ".lmg.json").write_text(json.dumps({
+                    "endpoint": api.endpoint,
+                }))
+                proc = subprocess.run(
+                    [BIN, "--yolo", "-C", repo, "question"],
+                    env={**os.environ, "HOME": home},
+                    text=True, capture_output=True, timeout=10,
+                )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        request = api.requests[0][1]
+        self.assertEqual(
+            [message["role"] for message in request["messages"]],
+            ["system", "user"],
+        )
+        self.assertNotIn(
+            "load_agents_md",
+            [tool["function"]["name"] for tool in request["tools"]],
+        )
 
     def test_malformed_config_is_local_error(self):
         with tempfile.TemporaryDirectory() as home:
@@ -189,7 +305,7 @@ class LmgTests(unittest.TestCase):
             }
             api.responses = iter([
                 response(assistant),
-                response({"role": "assistant", "content": "sandbox answer"}),
+                response(finish_message(codemap("sandbox answer"))),
             ])
             with tempfile.TemporaryDirectory() as home:
                 pathlib.Path(home, ".lmg.json").write_text(json.dumps({
@@ -202,8 +318,11 @@ class LmgTests(unittest.TestCase):
                     text=True, capture_output=True, timeout=10,
                 )
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(proc.stdout, "sandbox answer\n")
-        tool_result = api.requests[1][1]["messages"][3]["content"]
+        self.assertEqual(json.loads(proc.stdout)["summary"], "sandbox answer")
+        tool_result = next(
+            message["content"] for message in api.requests[1][1]["messages"]
+            if message.get("tool_call_id") == "sandbox-call"
+        )
         if sys.platform.startswith("linux"):
             self.assertIn("cwd=/repo home=/tmp key=", tool_result)
         else:
@@ -213,6 +332,67 @@ class LmgTests(unittest.TestCase):
         self.assertIn("write=no", tool_result)
         self.assertIn("network=no", tool_result)
         self.assertFalse((REPO / "sandbox-write-test").exists())
+
+    def test_plain_assistant_answer_is_nudged_until_finish(self):
+        final_map = codemap("answer after nudge")
+        unfinished = {"role": "assistant", "content": "I found the answer."}
+        with MockAPI([response(unfinished), response(finish_message(final_map))]) as api:
+            with tempfile.TemporaryDirectory() as home:
+                pathlib.Path(home, ".lmg.json").write_text(json.dumps({
+                    "endpoint": api.endpoint,
+                }))
+                proc = subprocess.run(
+                    [BIN, "--yolo", "-C", REPO, "question"],
+                    env={**os.environ, "HOME": home},
+                    text=True, capture_output=True, timeout=10,
+                )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(json.loads(proc.stdout), final_map)
+        self.assertEqual(len(api.requests), 2)
+        messages = api.requests[1][1]["messages"]
+        unfinished_index = messages.index(unfinished)
+        nudge = messages[unfinished_index + 1]
+        self.assertEqual(nudge["role"], "user")
+        self.assertIn("not called finish", nudge["content"])
+        self.assertIn("Continue investigating", nudge["content"])
+
+    def test_invalid_codemap_gets_tool_error_and_can_retry(self):
+        invalid = finish_message({"summary": "missing fields"}, "bad-finish")
+        final_map = codemap("corrected")
+        with MockAPI([response(invalid), response(finish_message(final_map))]) as api:
+            with tempfile.TemporaryDirectory() as home:
+                pathlib.Path(home, ".lmg.json").write_text(json.dumps({
+                    "endpoint": api.endpoint,
+                }))
+                proc = subprocess.run(
+                    [BIN, "--yolo", "-C", REPO, "question"],
+                    env={**os.environ, "HOME": home},
+                    text=True, capture_output=True, timeout=10,
+                )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(json.loads(proc.stdout), final_map)
+        tool_result = next(
+            message for message in api.requests[1][1]["messages"]
+            if message.get("tool_call_id") == "bad-finish"
+        )
+        self.assertEqual(tool_result["role"], "tool")
+        self.assertEqual(tool_result["tool_call_id"], "bad-finish")
+        self.assertIn("Invalid codemap", tool_result["content"])
+
+    def test_agent_text_without_finish_exhausts_round_limit(self):
+        with MockAPI([response({"role": "assistant", "content": "done"})]) as api:
+            with tempfile.TemporaryDirectory() as home:
+                pathlib.Path(home, ".lmg.json").write_text(json.dumps({
+                    "endpoint": api.endpoint,
+                }))
+                proc = subprocess.run(
+                    [BIN, "--yolo", "-k", "1", "question"],
+                    cwd=REPO, env={**os.environ, "HOME": home},
+                    text=True, capture_output=True, timeout=10,
+                )
+        self.assertEqual(proc.returncode, 3)
+        self.assertEqual(proc.stdout, "")
+        self.assertEqual(proc.stderr, "lmg: agent exceeded 1 rounds\n")
 
     def test_http_error_is_api_error(self):
         class ErrorHandler(http.server.BaseHTTPRequestHandler):

@@ -34,6 +34,7 @@
 #define TOOL_OUTPUT_LIMIT (64U * 1024U)
 #define HTTP_RESPONSE_LIMIT (16U * 1024U * 1024U)
 #define CONFIG_FILE_LIMIT (16U * 1024U * 1024U)
+#define INSTRUCTION_FILE_LIMIT (256U * 1024U)
 #define COMMAND_TIMEOUT_SECONDS 30
 #define TOOL_PATH "/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
@@ -44,13 +45,24 @@
 static const char *SYSTEM_PROMPT =
     "You are a codebase search agent.\n\n"
     "Answer the user's question using evidence from the repository.\n\n"
-    "You have a bash tool. Use normal read-only Unix commands such as rg,\n"
+    "You have bash and finish tools. Use bash with normal read-only Unix commands such as rg,\n"
     "find, sed, awk, git, and cat to search and inspect the codebase.\n\n"
     "Search iteratively. Do not speculate when you can inspect the code.\n"
     "Avoid unnecessarily large outputs.\n"
-    "Stop once you have enough evidence.\n\n"
-    "Return a concise answer with relevant file:line references.\n"
-    "All repository paths in the final answer should be relative.";
+    "Once you have enough evidence, call finish exactly once and do not call it alongside bash.\n\n"
+    "The finish argument is a codemap with this shape:\n"
+    "- summary: a concise direct answer to the question\n"
+    "- nodes: relevant code locations, each with a unique id, a repository-relative\n"
+    "  file:line or file:start-end location, an optional symbol, and a description\n"
+    "- edges: relationships between node ids, each with from, to, and relation\n"
+    "Use an empty edges array when no relationship is needed. Every factual claim in\n"
+    "the summary should be supported by a node. Do not give the final answer as normal\n"
+    "assistant content; completion happens only by calling finish.";
+
+static const char *CONTINUE_NUDGE =
+    "You have not called finish, so the task is not complete. Continue investigating "
+    "with bash if needed, then call finish with the completed codemap. Do not return "
+    "the answer as normal assistant content.";
 
 static const unsigned char EMBEDDED_SKILL[] = {
 #include "skill.inc"
@@ -207,7 +219,8 @@ static json_object *parse_json_strict(const char *text, size_t len)
     return obj;
 }
 
-static int read_file(const char *path, char **out, size_t *out_len)
+static int read_file_limited(const char *path, size_t limit,
+                             char **out, size_t *out_len)
 {
     int fd = open(path, O_RDONLY | O_CLOEXEC);
     struct stat st;
@@ -216,7 +229,7 @@ static int read_file(const char *path, char **out, size_t *out_len)
     if (fd < 0)
         return -1;
     if (fstat(fd, &st) < 0 || st.st_size < 0 ||
-        (uintmax_t)st.st_size > CONFIG_FILE_LIMIT) {
+        (uintmax_t)st.st_size > limit) {
         close(fd);
         return -1;
     }
@@ -236,6 +249,11 @@ static int read_file(const char *path, char **out, size_t *out_len)
     *out = buf;
     *out_len = used;
     return 0;
+}
+
+static int read_file(const char *path, char **out, size_t *out_len)
+{
+    return read_file_limited(path, CONFIG_FILE_LIMIT, out, out_len);
 }
 
 static void merge_extra(struct config *cfg, json_object *extra)
@@ -937,28 +955,127 @@ static int post_chat(const struct config *cfg, json_object *request,
     return 0;
 }
 
-static json_object *make_tools(void)
+static json_object *string_schema(const char *description)
 {
-    json_object *tools = json_object_new_array();
+    json_object *schema = json_object_new_object();
+    json_object_object_add(schema, "type", json_object_new_string("string"));
+    if (description)
+        json_object_object_add(schema, "description", json_object_new_string(description));
+    return schema;
+}
+
+static json_object *required_names(const char **names, size_t count)
+{
+    json_object *required = json_object_new_array();
+    size_t i;
+    for (i = 0; i < count; i++)
+        json_object_array_add(required, json_object_new_string(names[i]));
+    return required;
+}
+
+static json_object *function_tool(const char *name, const char *description,
+                                  json_object *parameters)
+{
     json_object *tool = json_object_new_object();
     json_object *function = json_object_new_object();
-    json_object *parameters = json_object_new_object();
-    json_object *properties = json_object_new_object();
-    json_object *command = json_object_new_object();
-    json_object *required = json_object_new_array();
-    json_object_object_add(command, "type", json_object_new_string("string"));
-    json_object_object_add(properties, "command", command);
-    json_object_object_add(parameters, "type", json_object_new_string("object"));
-    json_object_object_add(parameters, "properties", properties);
-    json_object_array_add(required, json_object_new_string("command"));
-    json_object_object_add(parameters, "required", required);
-    json_object_object_add(function, "name", json_object_new_string("bash"));
-    json_object_object_add(function, "description",
-        json_object_new_string("Run a shell command in the repository to search or inspect the codebase."));
+    json_object_object_add(function, "name", json_object_new_string(name));
+    json_object_object_add(function, "description", json_object_new_string(description));
     json_object_object_add(function, "parameters", parameters);
     json_object_object_add(tool, "type", json_object_new_string("function"));
     json_object_object_add(tool, "function", function);
-    json_object_array_add(tools, tool);
+    return tool;
+}
+
+static json_object *make_bash_tool(void)
+{
+    const char *required[] = {"command"};
+    json_object *parameters = json_object_new_object();
+    json_object *properties = json_object_new_object();
+    json_object_object_add(properties, "command", string_schema(
+        "A read-only shell command that searches or inspects the repository."));
+    json_object_object_add(parameters, "type", json_object_new_string("object"));
+    json_object_object_add(parameters, "properties", properties);
+    json_object_object_add(parameters, "required", required_names(required, 1));
+    json_object_object_add(parameters, "additionalProperties", json_object_new_boolean(false));
+    return function_tool("bash",
+        "Run a shell command in the repository to search or inspect the codebase.",
+        parameters);
+}
+
+static json_object *make_finish_tool(void)
+{
+    const char *node_required[] = {"id", "location", "description"};
+    const char *edge_required[] = {"from", "to", "relation"};
+    const char *map_required[] = {"summary", "nodes", "edges"};
+    const char *finish_required[] = {"codemap"};
+    json_object *node = json_object_new_object();
+    json_object *node_properties = json_object_new_object();
+    json_object *edge = json_object_new_object();
+    json_object *edge_properties = json_object_new_object();
+    json_object *nodes = json_object_new_object();
+    json_object *edges = json_object_new_object();
+    json_object *codemap = json_object_new_object();
+    json_object *map_properties = json_object_new_object();
+    json_object *parameters = json_object_new_object();
+    json_object *finish_properties = json_object_new_object();
+
+    json_object_object_add(node_properties, "id", string_schema(
+        "A short unique id used by edges, such as auth-middleware."));
+    json_object_object_add(node_properties, "location", string_schema(
+        "A repository-relative file:line or file:start-end reference."));
+    json_object_object_add(node_properties, "symbol", string_schema(
+        "The relevant function, type, variable, or section name, when applicable."));
+    json_object_object_add(node_properties, "description", string_schema(
+        "The fact this location proves and its role in the answer."));
+    json_object_object_add(node, "type", json_object_new_string("object"));
+    json_object_object_add(node, "properties", node_properties);
+    json_object_object_add(node, "required", required_names(node_required, 3));
+    json_object_object_add(node, "additionalProperties", json_object_new_boolean(false));
+
+    json_object_object_add(edge_properties, "from", string_schema(
+        "The id of the source node."));
+    json_object_object_add(edge_properties, "to", string_schema(
+        "The id of the destination node."));
+    json_object_object_add(edge_properties, "relation", string_schema(
+        "A concise call, data-flow, control-flow, or ownership relationship."));
+    json_object_object_add(edge, "type", json_object_new_string("object"));
+    json_object_object_add(edge, "properties", edge_properties);
+    json_object_object_add(edge, "required", required_names(edge_required, 3));
+    json_object_object_add(edge, "additionalProperties", json_object_new_boolean(false));
+
+    json_object_object_add(nodes, "type", json_object_new_string("array"));
+    json_object_object_add(nodes, "description", json_object_new_string(
+        "The smallest set of code locations that supports the summary."));
+    json_object_object_add(nodes, "items", node);
+    json_object_object_add(edges, "type", json_object_new_string("array"));
+    json_object_object_add(edges, "description", json_object_new_string(
+        "Directed relationships between nodes; use an empty array when none are needed."));
+    json_object_object_add(edges, "items", edge);
+
+    json_object_object_add(map_properties, "summary", string_schema(
+        "A concise, direct, evidence-backed answer to the user's question."));
+    json_object_object_add(map_properties, "nodes", nodes);
+    json_object_object_add(map_properties, "edges", edges);
+    json_object_object_add(codemap, "type", json_object_new_string("object"));
+    json_object_object_add(codemap, "properties", map_properties);
+    json_object_object_add(codemap, "required", required_names(map_required, 3));
+    json_object_object_add(codemap, "additionalProperties", json_object_new_boolean(false));
+
+    json_object_object_add(finish_properties, "codemap", codemap);
+    json_object_object_add(parameters, "type", json_object_new_string("object"));
+    json_object_object_add(parameters, "properties", finish_properties);
+    json_object_object_add(parameters, "required", required_names(finish_required, 1));
+    json_object_object_add(parameters, "additionalProperties", json_object_new_boolean(false));
+    return function_tool("finish",
+        "Complete the task and return the final codemap. Call exactly once, without bash, only after gathering enough evidence.",
+        parameters);
+}
+
+static json_object *make_tools(void)
+{
+    json_object *tools = json_object_new_array();
+    json_object_array_add(tools, make_bash_tool());
+    json_object_array_add(tools, make_finish_tool());
     return tools;
 }
 
@@ -1003,46 +1120,242 @@ static json_object *response_message(json_object *response)
     return message;
 }
 
-static int parse_bash_call(json_object *call, const char **id, char **command)
+static int parse_tool_call(json_object *call, const char **id, const char **name,
+                           json_object **arguments)
 {
-    json_object *id_obj, *function, *name, *arguments, *args_obj, *command_obj;
-    const char *args_text;
-    size_t args_len;
+    json_object *id_obj, *function, *name_obj, *arguments_obj;
+    const char *arguments_text;
     if (!json_object_is_type(call, json_type_object) ||
         !json_object_object_get_ex(call, "id", &id_obj) ||
         !plain_json_string(id_obj) ||
         !json_object_object_get_ex(call, "function", &function) ||
         !json_object_is_type(function, json_type_object) ||
-        !json_object_object_get_ex(function, "name", &name) ||
-        !plain_json_string(name) ||
-        strcmp(plain_json_string(name), "bash") != 0 ||
-        !json_object_object_get_ex(function, "arguments", &arguments) ||
-        !plain_json_string(arguments))
+        !json_object_object_get_ex(function, "name", &name_obj) ||
+        !plain_json_string(name_obj) ||
+        !json_object_object_get_ex(function, "arguments", &arguments_obj) ||
+        !plain_json_string(arguments_obj))
         return -1;
-    args_text = plain_json_string(arguments);
-    args_len = strlen(args_text);
-    args_obj = parse_json_strict(args_text, args_len);
-    if (!args_obj || !json_object_is_type(args_obj, json_type_object) ||
-        !json_object_object_get_ex(args_obj, "command", &command_obj) ||
-        !plain_json_string(command_obj)) {
+    arguments_text = plain_json_string(arguments_obj);
+    *arguments = parse_json_strict(arguments_text, strlen(arguments_text));
+    if (!*arguments || !json_object_is_type(*arguments, json_type_object))
         return -1;
-    }
     *id = plain_json_string(id_obj);
+    *name = plain_json_string(name_obj);
+    return 0;
+}
+
+static int parse_bash_arguments(json_object *arguments, char **command)
+{
+    json_object *command_obj;
+    if (!json_object_object_get_ex(arguments, "command", &command_obj) ||
+        !plain_json_string(command_obj))
+        return -1;
     *command = xstrdup(plain_json_string(command_obj));
     return 0;
+}
+
+static bool nonempty_json_string(json_object *obj)
+{
+    const char *s = plain_json_string(obj);
+    return s && s[0];
+}
+
+static bool object_has_only(json_object *obj, const char **allowed, size_t count)
+{
+    json_object_object_foreach(obj, key, value) {
+        size_t i;
+        bool found = false;
+        (void)value;
+        for (i = 0; i < count; i++) {
+            if (strcmp(key, allowed[i]) == 0) {
+                found = true;
+                break;
+            }
+        }
+        if (!found)
+            return false;
+    }
+    return true;
+}
+
+static bool node_id_exists(json_object *nodes, const char *wanted)
+{
+    size_t i;
+    for (i = 0; i < json_object_array_length(nodes); i++) {
+        json_object *node = json_object_array_get_idx(nodes, i);
+        json_object *id;
+        if (json_object_object_get_ex(node, "id", &id) &&
+            plain_json_string(id) && strcmp(plain_json_string(id), wanted) == 0)
+            return true;
+    }
+    return false;
+}
+
+static const char *validate_codemap(json_object *arguments, json_object **codemap_out)
+{
+    const char *argument_keys[] = {"codemap"};
+    const char *map_keys[] = {"summary", "nodes", "edges"};
+    const char *node_keys[] = {"id", "location", "symbol", "description"};
+    const char *edge_keys[] = {"from", "to", "relation"};
+    json_object *codemap, *summary, *nodes, *edges;
+    size_t i, j;
+    if (!object_has_only(arguments, argument_keys, 1) ||
+        !json_object_object_get_ex(arguments, "codemap", &codemap) ||
+        !json_object_is_type(codemap, json_type_object))
+        return "finish requires exactly one codemap object";
+    if (!object_has_only(codemap, map_keys, 3) ||
+        !json_object_object_get_ex(codemap, "summary", &summary) ||
+        !nonempty_json_string(summary) ||
+        !json_object_object_get_ex(codemap, "nodes", &nodes) ||
+        !json_object_is_type(nodes, json_type_array) ||
+        !json_object_object_get_ex(codemap, "edges", &edges) ||
+        !json_object_is_type(edges, json_type_array))
+        return "codemap requires only a non-empty summary plus nodes and edges arrays";
+    for (i = 0; i < json_object_array_length(nodes); i++) {
+        json_object *node = json_object_array_get_idx(nodes, i);
+        json_object *id, *location, *symbol, *description;
+        if (!node || !json_object_is_type(node, json_type_object) ||
+            !object_has_only(node, node_keys, 4) ||
+            !json_object_object_get_ex(node, "id", &id) || !nonempty_json_string(id) ||
+            !json_object_object_get_ex(node, "location", &location) ||
+            !nonempty_json_string(location) ||
+            !json_object_object_get_ex(node, "description", &description) ||
+            !nonempty_json_string(description) ||
+            (json_object_object_get_ex(node, "symbol", &symbol) &&
+             !nonempty_json_string(symbol)))
+            return "each node requires non-empty id, location, and description strings; symbol is optional";
+        for (j = 0; j < i; j++) {
+            json_object *previous = json_object_array_get_idx(nodes, j);
+            json_object *previous_id;
+            json_object_object_get_ex(previous, "id", &previous_id);
+            if (strcmp(plain_json_string(id), plain_json_string(previous_id)) == 0)
+                return "node ids must be unique";
+        }
+    }
+    for (i = 0; i < json_object_array_length(edges); i++) {
+        json_object *edge = json_object_array_get_idx(edges, i);
+        json_object *from, *to, *relation;
+        if (!edge || !json_object_is_type(edge, json_type_object) ||
+            !object_has_only(edge, edge_keys, 3) ||
+            !json_object_object_get_ex(edge, "from", &from) ||
+            !nonempty_json_string(from) ||
+            !json_object_object_get_ex(edge, "to", &to) ||
+            !nonempty_json_string(to) ||
+            !json_object_object_get_ex(edge, "relation", &relation) ||
+            !nonempty_json_string(relation))
+            return "each edge requires non-empty from, to, and relation strings";
+        if (!node_id_exists(nodes, plain_json_string(from)) ||
+            !node_id_exists(nodes, plain_json_string(to)))
+            return "every edge endpoint must reference a node id";
+    }
+    *codemap_out = codemap;
+    return NULL;
+}
+
+static void append_tool_message(json_object *messages, const char *id,
+                                const char *content)
+{
+    json_object *message = json_object_new_object();
+    json_object_object_add(message, "role", json_object_new_string("tool"));
+    json_object_object_add(message, "tool_call_id", json_object_new_string(id));
+    json_object_object_add(message, "content", json_object_new_string(content));
+    json_object_array_add(messages, message);
+}
+
+static int load_repository_instructions(const struct config *cfg,
+                                        const char **filename, char **content)
+{
+    const char *candidates[] = {"AGENTS.md", "CLAUDE.md"};
+    size_t i;
+    *filename = NULL;
+    *content = NULL;
+    for (i = 0; i < 2; i++) {
+        char *path = xasprintf("%s/%s", cfg->repo, candidates[i]);
+        char *resolved;
+        struct stat st;
+        size_t len;
+        size_t repo_len;
+        if (stat(path, &st) < 0) {
+            if (errno == ENOENT)
+                continue;
+            *filename = candidates[i];
+            return -1;
+        }
+        *filename = candidates[i];
+        resolved = realpath(path, NULL);
+        repo_len = strlen(cfg->repo);
+        if (!S_ISREG(st.st_mode) ||
+            !resolved ||
+            (strcmp(cfg->repo, "/") != 0 &&
+             (strncmp(resolved, cfg->repo, repo_len) != 0 ||
+              resolved[repo_len] != '/')) ||
+            read_file_limited(resolved, INSTRUCTION_FILE_LIMIT, content, &len) < 0 ||
+            strlen(*content) != len)
+            return -1;
+        return 1;
+    }
+    return 0;
+}
+
+static void append_instruction_context(json_object *messages,
+                                       const char *filename, const char *content)
+{
+    const char *call_id = "lmg-load-agents-md";
+    json_object *assistant = json_object_new_object();
+    json_object *calls = json_object_new_array();
+    json_object *call = json_object_new_object();
+    json_object *function = json_object_new_object();
+    json_object *arguments = json_object_new_object();
+    const char *arguments_text;
+    char *result;
+
+    json_object_object_add(arguments, "path", json_object_new_string(filename));
+    arguments_text = json_object_to_json_string_ext(arguments, JSON_C_TO_STRING_PLAIN);
+    json_object_object_add(function, "name", json_object_new_string("load_agents_md"));
+    json_object_object_add(function, "arguments", json_object_new_string(arguments_text));
+    json_object_object_add(call, "id", json_object_new_string(call_id));
+    json_object_object_add(call, "type", json_object_new_string("function"));
+    json_object_object_add(call, "function", function);
+    json_object_array_add(calls, call);
+    json_object_object_add(assistant, "role", json_object_new_string("assistant"));
+    json_object_object_add(assistant, "content", NULL);
+    json_object_object_add(assistant, "tool_calls", calls);
+    json_object_array_add(messages, assistant);
+
+    result = xasprintf("Repository instructions loaded from %s:\n\n%s",
+                       filename, content);
+    append_tool_message(messages, call_id, result);
+}
+
+static void print_codemap(json_object *codemap)
+{
+    const char *text = json_object_to_json_string_ext(codemap, JSON_C_TO_STRING_PRETTY);
+    fwrite(text, 1, strlen(text), stdout);
+    fputc('\n', stdout);
 }
 
 static int run_agent(const struct config *cfg, const struct run_context *ctx)
 {
     json_object *messages = json_object_new_array();
     json_object *tools = make_tools();
+    const char *instruction_filename;
+    char *instruction_content;
+    int instruction_status;
     int round, rc = EXIT_AGENT;
     json_object_array_add(messages, make_message("system", SYSTEM_PROMPT));
+    instruction_status = load_repository_instructions(
+        cfg, &instruction_filename, &instruction_content);
+    if (instruction_status < 0) {
+        fprintf(stderr, "lmg: cannot load %s\n", instruction_filename);
+        return EXIT_LOCAL;
+    }
+    if (instruction_status > 0)
+        append_instruction_context(messages, instruction_filename, instruction_content);
     json_object_array_add(messages, make_message("user", cfg->question));
     for (round = 1; round <= cfg->max_steps; round++) {
         json_object *request = make_request(cfg, messages, tools);
         json_object *response = NULL;
-        json_object *message, *calls, *content;
+        json_object *message, *calls;
         size_t i, call_count = 0;
         if (post_chat(cfg, request, &response) < 0) {
             rc = EXIT_API;
@@ -1065,48 +1378,61 @@ static int run_agent(const struct config *cfg, const struct run_context *ctx)
         if (call_count) {
             for (i = 0; i < call_count; i++) {
                 json_object *call = json_object_array_get_idx(calls, i);
-                json_object *tool_message;
-                struct command_result result;
-                const char *id;
-                char *command = NULL;
-                char *result_text;
-                if (parse_bash_call(call, &id, &command) < 0) {
-                    fputs("lmg: malformed arguments for bash\n", stderr);
+                json_object *arguments;
+                const char *id, *name;
+                if (parse_tool_call(call, &id, &name, &arguments) < 0) {
+                    fputs("lmg: malformed tool call\n", stderr);
                     rc = EXIT_LOCAL;
                     break;
                 }
-                if (cfg->verbose)
-                    fprintf(stderr, "lmg: bash: %s\n", command);
-                if (execute_command(ctx, command, &result) < 0) {
-                    fputs("lmg: cannot execute bash\n", stderr);
-                    rc = EXIT_LOCAL; break;
+                if (strcmp(name, "bash") == 0) {
+                    struct command_result result;
+                    char *command = NULL;
+                    char *result_text;
+                    if (parse_bash_arguments(arguments, &command) < 0) {
+                        fputs("lmg: malformed arguments for bash\n", stderr);
+                        rc = EXIT_LOCAL;
+                        break;
+                    }
+                    if (cfg->verbose)
+                        fprintf(stderr, "lmg: bash: %s\n", command);
+                    if (execute_command(ctx, command, &result) < 0) {
+                        fputs("lmg: cannot execute bash\n", stderr);
+                        rc = EXIT_LOCAL;
+                        break;
+                    }
+                    if (cfg->verbose)
+                        fprintf(stderr, "lmg: bash exited %d%s\n", result.exit_code,
+                                result.timed_out ? " (timed out)" : "");
+                    result_text = format_command_result(&result);
+                    append_tool_message(messages, id, result_text);
+                } else if (strcmp(name, "finish") == 0) {
+                    json_object *codemap = NULL;
+                    const char *error;
+                    if (call_count != 1) {
+                        append_tool_message(messages, id,
+                            "finish must be the only tool call in the turn. Continue, then call finish by itself.");
+                        continue;
+                    }
+                    error = validate_codemap(arguments, &codemap);
+                    if (error) {
+                        char *result_text = xasprintf(
+                            "Invalid codemap: %s. Correct it and call finish again.", error);
+                        append_tool_message(messages, id, result_text);
+                        continue;
+                    }
+                    print_codemap(codemap);
+                    return 0;
+                } else {
+                    fprintf(stderr, "lmg: unknown tool: %s\n", name);
+                    rc = EXIT_LOCAL;
+                    break;
                 }
-                if (cfg->verbose)
-                    fprintf(stderr, "lmg: bash exited %d%s\n", result.exit_code,
-                            result.timed_out ? " (timed out)" : "");
-                result_text = format_command_result(&result);
-                tool_message = json_object_new_object();
-                json_object_object_add(tool_message, "role", json_object_new_string("tool"));
-                json_object_object_add(tool_message, "tool_call_id", json_object_new_string(id));
-                json_object_object_add(tool_message, "content", json_object_new_string(result_text));
-                json_object_array_add(messages, tool_message);
             }
             if (rc == EXIT_LOCAL) break;
             continue;
         }
-        if (json_object_object_get_ex(message, "content", &content) &&
-            json_object_is_type(content, json_type_string) &&
-            json_object_get_string_len(content) > 0) {
-            const char *answer = json_object_get_string(content);
-            size_t answer_len = (size_t)json_object_get_string_len(content);
-            fwrite(answer, 1, answer_len, stdout);
-            if (answer[answer_len - 1] != '\n') fputc('\n', stdout);
-            rc = 0;
-            break;
-        }
-        fputs("lmg: agent failed to produce an answer\n", stderr);
-        rc = EXIT_AGENT;
-        break;
+        json_object_array_add(messages, make_message("user", CONTINUE_NUDGE));
     }
     if (round > cfg->max_steps && rc == EXIT_AGENT)
         fprintf(stderr, "lmg: agent exceeded %d rounds\n", cfg->max_steps);
