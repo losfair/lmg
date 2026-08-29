@@ -45,6 +45,11 @@ There is no daemon, index, database, persistent state, SDK, or external language
 
 `lmg` communicates with an OpenAI-compatible `/chat/completions` endpoint using native function calling.
 
+`SKILL.md` contains concise instructions for coding agents that invoke `lmg`.
+The build embeds that file byte-for-byte in the executable; `lmg --skill`
+prints the embedded copy to stdout without loading configuration or accessing
+the network.
+
 ### Memory lifetime
 
 `lmg` deliberately uses process-lifetime allocation. The C program contains no
@@ -76,6 +81,7 @@ The current directory is the repository root by default.
 -k N            maximum agent rounds
 --verbose       print tool activity to stderr
 --yolo          execute bash without OS sandboxing
+--skill         print the embedded coding-agent skill and exit
 ```
 
 Example:

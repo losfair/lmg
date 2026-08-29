@@ -59,6 +59,17 @@ def response(message):
 
 
 class LmgTests(unittest.TestCase):
+    def test_embedded_skill_matches_skill_file(self):
+        with tempfile.TemporaryDirectory() as home:
+            pathlib.Path(home, ".lmg.json").write_text("{")
+            proc = subprocess.run(
+                [BIN, "--skill"], env={**os.environ, "HOME": home},
+                capture_output=True,
+            )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout, (REPO / "SKILL.md").read_bytes())
+        self.assertEqual(proc.stderr, b"")
+
     def test_process_lifetime_allocation_has_no_release_calls(self):
         source = (REPO / "lmg.c").read_text()
         forbidden = [
@@ -94,7 +105,9 @@ class LmgTests(unittest.TestCase):
                     "type": "function",
                     "function": {
                         "name": "bash",
-                        "arguments": json.dumps({"command": "yes x | head -c 70000"}),
+                        "arguments": json.dumps({
+                            "command": "awk 'BEGIN { for (i = 0; i < 35000; i++) print \"x\" }'"
+                        }),
                     },
                 },
             ],
@@ -184,14 +197,18 @@ class LmgTests(unittest.TestCase):
                     "api_key": "sandbox-secret",
                 }))
                 proc = subprocess.run(
-                    [BIN, "-C", REPO, "question"],
+                    [BIN, "--verbose", "-C", REPO, "question"],
                     env={**os.environ, "HOME": home},
                     text=True, capture_output=True, timeout=10,
                 )
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(proc.stdout, "sandbox answer\n")
         tool_result = api.requests[1][1]["messages"][3]["content"]
-        self.assertIn("cwd=/repo home=/tmp key=", tool_result)
+        if sys.platform.startswith("linux"):
+            self.assertIn("cwd=/repo home=/tmp key=", tool_result)
+        else:
+            self.assertIn(f"cwd={REPO} home=/tmp/lmg.", tool_result)
+            self.assertIn(" key=", tool_result)
         self.assertNotIn("sandbox-secret", tool_result)
         self.assertIn("write=no", tool_result)
         self.assertIn("network=no", tool_result)

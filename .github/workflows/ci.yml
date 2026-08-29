@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap libcurl4-openssl-dev libjson-c-dev pkg-config
+
+      - name: Enable Linux user namespaces
+        if: runner.os == 'Linux'
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
+      - name: Install macOS dependencies
+        if: runner.os == 'macOS'
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: 1
+        run: brew install curl json-c pkg-config
+
+      - name: Configure Homebrew pkg-config paths
+        if: runner.os == 'macOS'
+        run: echo "PKG_CONFIG_PATH=$(brew --prefix curl)/lib/pkgconfig:$(brew --prefix json-c)/lib/pkgconfig" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: make CFLAGS='-O2 -Werror' CPPFLAGS="$(pkg-config --cflags libcurl json-c)" LDLIBS="$(pkg-config --libs libcurl json-c)"
+
+      - name: Test
+        run: make test
+
+      - name: Show macOS sandbox denials
+        if: failure() && runner.os == 'macOS'
+        run: sudo /usr/bin/log show --last 5m --style compact --predicate 'process == "sandboxd" OR eventMessage CONTAINS[c] "deny"' | tail -200

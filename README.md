@@ -12,9 +12,10 @@ Install the development packages for libcurl and json-c, then run:
 make
 ```
 
-The equivalent direct command is:
+The build embeds `SKILL.md` before compiling. The equivalent commands are:
 
 ```sh
+make skill.inc
 cc -O2 -o lmg lmg.c -lcurl -ljson-c
 ```
 
@@ -55,6 +56,12 @@ Configuration may also be supplied with `LMG_ENDPOINT`, `LMG_API_KEY`,
 
 `--yolo` disables only the OS sandbox. Command timeouts, output limits, agent
 round limits, and environment scrubbing remain active.
+
+Coding agents can load the bundled usage skill without locating project files:
+
+```sh
+lmg --skill
+```
 
 ## Test
 

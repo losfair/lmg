@@ -1,5 +1,8 @@
 #define _GNU_SOURCE
 #define _XOPEN_SOURCE 700
+#ifdef __APPLE__
+#define _DARWIN_C_SOURCE
+#endif
 
 #include <curl/curl.h>
 #include <json-c/json.h>
@@ -32,6 +35,7 @@
 #define HTTP_RESPONSE_LIMIT (16U * 1024U * 1024U)
 #define CONFIG_FILE_LIMIT (16U * 1024U * 1024U)
 #define COMMAND_TIMEOUT_SECONDS 30
+#define TOOL_PATH "/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
 #define EXIT_LOCAL 1
 #define EXIT_API 2
@@ -47,6 +51,10 @@ static const char *SYSTEM_PROMPT =
     "Stop once you have enough evidence.\n\n"
     "Return a concise answer with relevant file:line references.\n"
     "All repository paths in the final answer should be relative.";
+
+static const unsigned char EMBEDDED_SKILL[] = {
+#include "skill.inc"
+};
 
 struct config {
     char *endpoint;
@@ -346,7 +354,18 @@ static int load_environment(struct config *cfg)
 
 static void usage(FILE *f)
 {
-    fputs("usage: lmg [-C DIR] [-m MODEL] [-e URL] [-k N] [--verbose] [--yolo] QUESTION\n", f);
+    fputs("usage: lmg [-C DIR] [-m MODEL] [-e URL] [-k N] [--verbose] [--yolo] QUESTION\n"
+          "       lmg --skill\n", f);
+}
+
+static int print_embedded_skill(void)
+{
+    size_t len = sizeof(EMBEDDED_SKILL) - 1;
+    if (fwrite(EMBEDDED_SKILL, 1, len, stdout) != len) {
+        fputs("lmg: cannot write skill\n", stderr);
+        return EXIT_LOCAL;
+    }
+    return 0;
 }
 
 static int parse_cli(struct config *cfg, int argc, char **argv)
@@ -447,23 +466,44 @@ static int write_macos_profile(struct run_context *ctx)
     profile = xasprintf(
         "(version 1)\n"
         "(deny default)\n"
-        "(allow process*)\n"
-        "(allow signal (target self))\n"
+        "(allow process-exec)\n"
+        "(allow process-fork)\n"
+        "(allow process-info* (target same-sandbox))\n"
+        "(allow signal (target same-sandbox))\n"
         "(allow sysctl-read)\n"
         "(allow mach-lookup)\n"
-        "(allow file-read*\n"
+        "(allow user-preference-read)\n"
+        "(allow file-read* file-test-existence\n"
         "  (subpath %s)\n"
         "  (subpath %s)\n"
         "  (subpath \"/System\")\n"
         "  (subpath \"/usr\")\n"
         "  (subpath \"/bin\")\n"
         "  (subpath \"/sbin\")\n"
+        "  (subpath \"/opt/homebrew\")\n"
         "  (subpath \"/Library/Apple\")\n"
         "  (subpath \"/private/etc\")\n"
         "  (subpath \"/private/var/db/dyld\")\n"
         "  (subpath \"/dev\"))\n"
+        "(allow file-read* file-test-existence (literal \"/\"))\n"
+        "(allow file-read-metadata file-test-existence\n"
+        "  (literal \"/etc\")\n"
+        "  (literal \"/tmp\")\n"
+        "  (literal \"/var\")\n"
+        "  (path-ancestors %s))\n"
+        "(allow file-map-executable\n"
+        "  (subpath \"/System\")\n"
+        "  (subpath \"/usr/lib\")\n"
+        "  (subpath \"/Library/Apple\")\n"
+        "  (subpath \"/opt/homebrew/lib\")\n"
+        "  (subpath \"/usr/local/lib\"))\n"
+        "(allow system-mac-syscall (mac-policy-name \"vnguard\"))\n"
+        "(allow system-mac-syscall\n"
+        "  (require-all\n"
+        "    (mac-policy-name \"Sandbox\")\n"
+        "    (mac-syscall-number 67)))\n"
         "(allow file-write* (subpath %s))\n",
-        repo, tmp, tmp);
+        repo, tmp, repo, tmp);
     fd = open(ctx->profile_path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
     if (fd < 0) {
         return -1;
@@ -532,7 +572,7 @@ static char **minimal_environment(const struct run_context *ctx)
 {
     char **env = calloc(6, sizeof(char *));
     if (!env) die_oom();
-    env[0] = xstrdup("PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin");
+    env[0] = xasprintf("PATH=%s", TOOL_PATH);
     env[1] = xstrdup("LANG=C.UTF-8");
     env[2] = xstrdup("LC_ALL=C.UTF-8");
     env[3] = xasprintf("HOME=%s", ctx->temp_dir);
@@ -608,7 +648,7 @@ static void exec_linux_sandbox(const struct run_context *ctx, const char *comman
     push_arg(argv, &n, (char *)"/tmp");
     push_arg(argv, &n, (char *)"--setenv");
     push_arg(argv, &n, (char *)"PATH");
-    push_arg(argv, &n, (char *)"/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin");
+    push_arg(argv, &n, (char *)TOOL_PATH);
     push_arg(argv, &n, (char *)"--setenv");
     push_arg(argv, &n, (char *)"LANG");
     push_arg(argv, &n, (char *)"C.UTF-8");
@@ -697,6 +737,7 @@ static int execute_command(const struct run_context *ctx, const char *command,
     }
     if (pid == 0) {
         setpgid(0, 0);
+        signal(SIGPIPE, SIG_DFL);
         dup2(out_pipe[1], STDOUT_FILENO);
         dup2(err_pipe[1], STDERR_FILENO);
         close_pipe(out_pipe); close_pipe(err_pipe);
@@ -819,6 +860,9 @@ static bool sandbox_available(const struct run_context *ctx)
 #else
         fputs("lmg: bwrap failed; use --yolo to run unsandboxed\n", stderr);
 #endif
+        if (ctx->cfg->verbose)
+            fprintf(stderr, "lmg: sandbox exited %d%s\n", result.exit_code,
+                    result.timed_out ? " (timed out)" : "");
         if (ctx->cfg->verbose && result.err.len)
             fprintf(stderr, "lmg: sandbox: %.*s", (int)result.err.len, result.err.data);
     }
@@ -1074,12 +1118,14 @@ int main(int argc, char **argv)
     struct config cfg;
     struct run_context run;
     int rc = EXIT_LOCAL;
+    signal(SIGPIPE, SIG_IGN);
+    if (argc == 2 && strcmp(argv[1], "--skill") == 0)
+        return print_embedded_skill();
     memset(&cfg, 0, sizeof(cfg));
     cfg.model = xstrdup(DEFAULT_MODEL);
     cfg.max_steps = DEFAULT_MAX_STEPS;
     cfg.extra = json_object_new_object();
     if (!cfg.extra) die_oom();
-    signal(SIGPIPE, SIG_IGN);
     if (load_file_config(&cfg) < 0 || load_environment(&cfg) < 0 ||
         parse_cli(&cfg, argc, argv) < 0 || resolve_repo(&cfg) < 0)
         goto done;
