@@ -1329,7 +1329,8 @@ static void append_instruction_context(json_object *messages,
 
 static void print_codemap(json_object *codemap)
 {
-    const char *text = json_object_to_json_string_ext(codemap, JSON_C_TO_STRING_PRETTY);
+    const char *text = json_object_to_json_string_ext(
+        codemap, JSON_C_TO_STRING_PRETTY | JSON_C_TO_STRING_NOSLASHESCAPE);
     fwrite(text, 1, strlen(text), stdout);
     fputc('\n', stdout);
 }

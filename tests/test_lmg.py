@@ -143,6 +143,7 @@ class LmgTests(unittest.TestCase):
             ],
         }
         final_map = codemap()
+        final_map["nodes"][0]["location"] = "systems/README.md:1-40"
         with MockAPI([response(assistant), response(finish_message(final_map))]) as api:
             with tempfile.TemporaryDirectory() as home:
                 pathlib.Path(home, ".lmg.json").write_text(json.dumps({
@@ -165,6 +166,8 @@ class LmgTests(unittest.TestCase):
                 )
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(json.loads(proc.stdout), final_map)
+        self.assertIn('"location":"systems/README.md:1-40"', proc.stdout.replace(" ", ""))
+        self.assertNotIn(r"\/", proc.stdout)
         self.assertEqual(proc.stderr, "")
         self.assertEqual(len(api.requests), 2)
         headers, first = api.requests[0]
