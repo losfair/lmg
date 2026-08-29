@@ -34,6 +34,9 @@
 #define CONFIG_FILE_LIMIT (16U * 1024U * 1024U)
 #define INSTRUCTION_FILE_LIMIT (256U * 1024U)
 #define COMMAND_TIMEOUT_SECONDS 30
+#define COMMAND_TIMEOUT_GRACE_SECONDS 5
+#define CODEMAP_MAX_NODES 1000
+#define CODEMAP_MAX_EDGES 1000
 #define RETRY_INITIAL_SECONDS 1U
 #define RETRY_MAX_SECONDS 30U
 #define TOOL_PATH "/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
@@ -89,7 +92,7 @@ struct run_context {
     const struct config *cfg;
     char *temp_dir;
 #ifdef __APPLE__
-    char *profile_path;
+    char *profile;
 #endif
 };
 
@@ -206,16 +209,30 @@ static json_object *parse_json_strict(const char *text, size_t len)
 }
 
 static int read_file_limited(const char *path, size_t limit,
-                             char **out, size_t *out_len)
+                             const struct stat *expected, char **out,
+                             size_t *out_len)
 {
-    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    int fd = open(path, O_RDONLY | O_CLOEXEC | O_NONBLOCK);
     struct stat st;
     char *buf;
     size_t used = 0;
     if (fd < 0)
         return -1;
-    if (fstat(fd, &st) < 0 || st.st_size < 0 ||
-        (uintmax_t)st.st_size > limit) {
+    if (fstat(fd, &st) < 0) {
+        close(fd);
+        return -1;
+    }
+    /* A FIFO or device swap must fail fast rather than block during a read. */
+    if (!S_ISREG(st.st_mode)) {
+        close(fd);
+        return -1;
+    }
+    if (expected &&
+        (st.st_dev != expected->st_dev || st.st_ino != expected->st_ino)) {
+        close(fd);
+        return -1;
+    }
+    if (st.st_size < 0 || (uintmax_t)st.st_size > limit) {
         close(fd);
         return -1;
     }
@@ -235,11 +252,6 @@ static int read_file_limited(const char *path, size_t limit,
     *out = buf;
     *out_len = used;
     return 0;
-}
-
-static int read_file(const char *path, char **out, size_t *out_len)
-{
-    return read_file_limited(path, CONFIG_FILE_LIMIT, out, out_len);
 }
 
 static void merge_extra(struct config *cfg, json_object *extra)
@@ -313,7 +325,7 @@ static int load_file_config(struct config *cfg)
     if (access(path, F_OK) != 0) {
         return 0;
     }
-    if (read_file(path, &text, &len) < 0 ||
+    if (read_file_limited(path, CONFIG_FILE_LIMIT, NULL, &text, &len) < 0 ||
         !(root = parse_json_strict(text, len)) ||
         !apply_config_object(cfg, root)) {
         fputs("lmg: invalid ~/.lmg.json\n", stderr);
@@ -413,8 +425,6 @@ static int remove_tree_callback(const char *path, const struct stat *st,
 static void cleanup_run_context(struct run_context *ctx)
 {
     if (!ctx) return;
-#ifdef __APPLE__
-#endif
     if (ctx->temp_dir) {
         nftw(ctx->temp_dir, remove_tree_callback, 32, FTW_DEPTH | FTW_PHYS);
     }
@@ -441,15 +451,12 @@ static char *seatbelt_quote(const char *s)
     return out;
 }
 
-static int write_macos_profile(struct run_context *ctx)
+static void build_macos_profile(struct run_context *ctx)
 {
     char *repo = seatbelt_quote(ctx->cfg->repo);
     char *tmp = seatbelt_quote(ctx->temp_dir);
-    char *profile;
-    int fd;
-    size_t written = 0, profile_len;
-    ctx->profile_path = xasprintf("%s/sandbox.sb", ctx->temp_dir);
-    profile = xasprintf(
+    /* Keep the profile in memory so no writable filesystem path contains it. */
+    ctx->profile = xasprintf(
         "(version 1)\n"
         "(deny default)\n"
         "(allow process-exec)\n"
@@ -490,22 +497,6 @@ static int write_macos_profile(struct run_context *ctx)
         "    (mac-syscall-number 67)))\n"
         "(allow file-write* (subpath %s))\n",
         repo, tmp, repo, tmp);
-    fd = open(ctx->profile_path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
-    if (fd < 0) {
-        return -1;
-    }
-    profile_len = strlen(profile);
-    while (written < profile_len) {
-        ssize_t n = write(fd, profile + written, profile_len - written);
-        if (n < 0 && errno == EINTR) continue;
-        if (n <= 0) {
-            close(fd);
-            return -1;
-        }
-        written += (size_t)n;
-    }
-    close(fd);
-    return 0;
 }
 #endif
 
@@ -521,11 +512,8 @@ static int init_run_context(struct run_context *ctx, const struct config *cfg)
         return -1;
     }
 #ifdef __APPLE__
-    if (!cfg->yolo && write_macos_profile(ctx) < 0) {
-        fputs("lmg: cannot create sandbox profile\n", stderr);
-        cleanup_run_context(ctx);
-        return -1;
-    }
+    if (!cfg->yolo)
+        build_macos_profile(ctx);
 #endif
     return 0;
 }
@@ -657,7 +645,7 @@ static void exec_macos_sandbox(const struct run_context *ctx, const char *comman
 {
     const char *bash = bash_path();
     char *const argv[] = {
-        (char *)"sandbox-exec", (char *)"-f", ctx->profile_path,
+        (char *)"sandbox-exec", (char *)"-p", ctx->profile,
         (char *)bash, (char *)"-lc", (char *)command, NULL
     };
     if (!bash || access("/usr/bin/sandbox-exec", X_OK) != 0) _exit(127);
@@ -754,9 +742,23 @@ static int execute_command(const struct run_context *ctx, const char *command,
         if (!result->timed_out && monotonic_seconds() - start >= COMMAND_TIMEOUT_SECONDS) {
             result->timed_out = true;
             kill(-pid, SIGKILL);
+            /* Release the drain loop from descendants holding pipe write ends. */
+            if (out_pipe[0] >= 0) {
+                close(out_pipe[0]);
+                out_pipe[0] = -1;
+            }
+            if (err_pipe[0] >= 0) {
+                close(err_pipe[0]);
+                err_pipe[0] = -1;
+            }
+            out_open = false;
+            err_open = false;
         }
-        if (nfds)
-            poll(fds, nfds, 100);
+        if (result->timed_out &&
+            monotonic_seconds() - start >=
+            COMMAND_TIMEOUT_SECONDS + COMMAND_TIMEOUT_GRACE_SECONDS)
+            break;
+        poll(fds, nfds, 100);
         if (out_open) drain_fd(out_pipe[0], &result->out, &out_open);
         if (err_open) drain_fd(err_pipe[0], &result->err, &err_open);
         if (!child_done) {
@@ -1359,6 +1361,9 @@ static const char *validate_codemap(json_object *arguments, json_object **codema
         !json_object_object_get_ex(codemap, "edges", &edges) ||
         !json_object_is_type(edges, json_type_array))
         return "codemap requires only a non-empty summary plus nodes and edges arrays";
+    if (json_object_array_length(nodes) > CODEMAP_MAX_NODES ||
+        json_object_array_length(edges) > CODEMAP_MAX_EDGES)
+        return "codemap too large: at most 1000 nodes and 1000 edges";
     for (i = 0; i < json_object_array_length(nodes); i++) {
         json_object *node = json_object_array_get_idx(nodes, i);
         json_object *id, *location, *symbol, *description;
@@ -1437,7 +1442,8 @@ static int load_repository_instructions(const struct config *cfg,
             (strcmp(cfg->repo, "/") != 0 &&
              (strncmp(resolved, cfg->repo, repo_len) != 0 ||
               resolved[repo_len] != '/')) ||
-            read_file_limited(resolved, INSTRUCTION_FILE_LIMIT, content, &len) < 0 ||
+            read_file_limited(resolved, INSTRUCTION_FILE_LIMIT, &st,
+                              content, &len) < 0 ||
             strlen(*content) != len)
             return -1;
         return 1;

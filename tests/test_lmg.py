@@ -151,6 +151,13 @@ class LmgTests(unittest.TestCase):
         for pattern in forbidden:
             self.assertIsNone(re.search(pattern, source), pattern)
 
+    def test_macos_profile_is_not_stored_in_writable_temp(self):
+        source = (REPO / "lmg.c").read_text()
+        self.assertIn('(char *)"sandbox-exec", (char *)"-p", ctx->profile', source)
+        self.assertIn('"(allow file-write* (subpath %s))\\n"', source)
+        self.assertNotIn("profile_path", source)
+        self.assertNotIn("sandbox.sb", source)
+
     def test_agent_loop_config_precedence_reasoning_usage_and_output_limits(self):
         assistant = {
             "role": "assistant",
@@ -346,6 +353,8 @@ class LmgTests(unittest.TestCase):
         with MockAPI([]) as api:
             command = (
                 "printf 'cwd=%s home=%s key=%s\\n' \"$PWD\" \"$HOME\" \"$LMG_API_KEY\"; "
+                "if p=$(mktemp \"$TMPDIR/lmg-write-test.XXXXXX\" 2>/dev/null); "
+                "then rm -f \"$p\"; echo temp-write=yes; else echo temp-write=no; fi; "
                 "if touch sandbox-write-test 2>/dev/null; then echo write=yes; else echo write=no; fi; "
                 f"if bash -c 'echo x >/dev/tcp/127.0.0.1/{api.server.server_port}' 2>/dev/null; "
                 "then echo network=yes; else echo network=no; fi"
@@ -385,6 +394,7 @@ class LmgTests(unittest.TestCase):
             self.assertIn(f"cwd={REPO} home=/tmp/lmg.", tool_result)
             self.assertIn(" key=", tool_result)
         self.assertNotIn("sandbox-secret", tool_result)
+        self.assertIn("temp-write=yes", tool_result)
         self.assertIn("write=no", tool_result)
         self.assertIn("network=no", tool_result)
         self.assertFalse((REPO / "sandbox-write-test").exists())

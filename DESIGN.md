@@ -495,8 +495,11 @@ macOS uses `sandbox-exec` with a generated Seatbelt profile.
 Conceptually:
 
 ```sh
-sandbox-exec -f PROFILE /bin/bash -lc "$command"
+sandbox-exec -p PROFILE /bin/bash -lc "$command"
 ```
+
+The generated profile is passed in memory rather than written beneath the
+writable temporary directory.
 
 The profile uses default-deny behavior and permits only what the search shell needs:
 
@@ -517,7 +520,7 @@ network access
 unrelated filesystem access
 ```
 
-A fresh temporary directory and sandbox profile are generated for each `lmg` invocation and removed afterwards.
+A fresh temporary directory and sandbox profile are generated for each `lmg` invocation. The directory is removed afterwards; the in-memory profile lasts for the process lifetime.
 
 As on Linux, the repository should appear to the shell under a predictable path and commands run with that directory as the working directory.
 
