@@ -45,6 +45,20 @@ There is no daemon, index, database, persistent state, SDK, or external language
 
 `lmg` communicates with an OpenAI-compatible `/chat/completions` endpoint using native function calling.
 
+### Memory lifetime
+
+`lmg` deliberately uses process-lifetime allocation. The C program contains no
+memory-release operations: it does not free or resize heap allocations,
+decrement JSON reference counts, free JSON tokenizers, or tear down libcurl
+objects. Configuration strings, JSON conversation trees, HTTP handles, headers,
+and bounded I/O buffers remain live until the process exits, at which point the
+operating system reclaims them together.
+
+This is an intentional safety tradeoff for a small, short-running program with
+a bounded agent loop: ownership and cleanup ordering cannot introduce
+use-after-free bugs. File descriptors, child processes, and temporary filesystem
+state are still cleaned up promptly because they affect external system state.
+
 ---
 
 ## CLI
@@ -644,4 +658,3 @@ small evidence-rich answer
 ```
 
 Everything inside that boundary should remain as simple as possible.
-
